@@ -492,7 +492,7 @@ contextBridge.exposeInMainWorld('electron', {
   im: {
     // Configuration
     getConfig: () => ipcRenderer.invoke('im:config:get'),
-    setConfig: (config: any, options?: { syncGateway?: boolean }) =>
+    setConfig: (config: any, options?: { syncGateway?: boolean; restartGatewayIfRunning?: boolean }) =>
       ipcRenderer.invoke('im:config:set', config, options),
     syncConfig: () => ipcRenderer.invoke('im:config:sync'),
 

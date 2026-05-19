@@ -67,6 +67,10 @@ import type {
   WecomOpenClawConfig,
 } from '../types/im';
 
+type IMConfigUpdateOptions = {
+  restartGatewayIfRunning?: boolean;
+};
+
 class IMService {
   private statusUnsubscribe: (() => void) | null = null;
   private messageUnsubscribe: (() => void) | null = null;
@@ -156,10 +160,16 @@ class IMService {
    * Update configuration and trigger gateway sync/restart.
    * Used by toggleGateway and other operations that need immediate effect.
    */
-  async updateConfig(config: Partial<IMGatewayConfig>): Promise<boolean> {
+  async updateConfig(
+    config: Partial<IMGatewayConfig>,
+    options: IMConfigUpdateOptions = {},
+  ): Promise<boolean> {
     try {
       store.dispatch(setLoading(true));
-      const result: IMGatewayResult = await window.electron.im.setConfig(config, { syncGateway: true });
+      const result: IMGatewayResult = await window.electron.im.setConfig(config, {
+        syncGateway: true,
+        restartGatewayIfRunning: options.restartGatewayIfRunning ?? true,
+      });
       if (result.success) {
         // Reload config to get merged values
         await this.loadConfig();

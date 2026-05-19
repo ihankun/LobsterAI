@@ -118,7 +118,10 @@ export interface IMGatewayManagerOptions {
   coworkRuntime?: CoworkRuntime;
   coworkStore?: CoworkStore;
   ensureCoworkReady?: () => Promise<void>;
-  syncOpenClawConfig?: (reason?: string) => Promise<void>;
+  syncOpenClawConfig?: (
+    reason?: string,
+    options?: { restartGatewayIfRunning?: boolean },
+  ) => Promise<void>;
   ensureOpenClawGatewayConnected?: () => Promise<void>;
   getOpenClawGatewayClient?: () => GatewayClientLike | null;
   ensureOpenClawGatewayReady?: () => Promise<void>;
@@ -138,7 +141,9 @@ export class IMGatewayManager extends EventEmitter {
   private getLLMConfig: (() => Promise<any>) | null = null;
   private getSkillsPrompt: (() => Promise<string | null>) | null = null;
   private ensureCoworkReady: (() => Promise<void>) | null = null;
-  private syncOpenClawConfig: ((reason?: string) => Promise<void>) | null = null;
+  private syncOpenClawConfig:
+    | ((reason?: string, options?: { restartGatewayIfRunning?: boolean }) => Promise<void>)
+    | null = null;
   private ensureOpenClawGatewayConnected: (() => Promise<void>) | null = null;
   private getOpenClawGatewayClient: (() => GatewayClientLike | null) | null = null;
   private ensureOpenClawGatewayReady: (() => Promise<void>) | null = null;
@@ -390,7 +395,10 @@ export class IMGatewayManager extends EventEmitter {
     return this.imStore;
   }
 
-  setConfig(config: Partial<IMGatewayConfig>, options?: { syncGateway?: boolean }): void {
+  setConfig(
+    config: Partial<IMGatewayConfig>,
+    options?: { syncGateway?: boolean; restartGatewayIfRunning?: boolean },
+  ): void {
     const previousConfig = this.imStore.getConfig();
     this.imStore.setConfig(config);
 
@@ -417,7 +425,9 @@ export class IMGatewayManager extends EventEmitter {
         newNb.secret !== oldNb?.secret;
       if (credentialsChanged) {
         console.log('[IMGatewayManager] netease-bee credentials changed, syncing OpenClaw config...');
-        this.syncOpenClawConfig?.('im-config-change:netease-bee');
+        this.syncOpenClawConfig?.('im-config-change:netease-bee', {
+          restartGatewayIfRunning: options?.restartGatewayIfRunning,
+        });
       }
     }
 
@@ -1682,12 +1692,23 @@ export class IMGatewayManager extends EventEmitter {
         alreadyConnected,
         accountId: resolvedAccountId,
       }));
-      if (result.connected) {
+      if (result.connected || alreadyConnected) {
+        if (resolvedAccountId) {
+          this.setConfig({
+            weixin: {
+              ...this.getConfig().weixin,
+              enabled: true,
+              accountId: resolvedAccountId,
+            },
+          }, { syncGateway: false });
+        }
         // Sync config and restart gateway so the weixin channel starts with
         // the newly saved account credentials. The gateway's web.login.wait
         // handler called context.startChannel, but the channel may not fully
         // initialize without a proper config-driven restart.
-        await this.syncOpenClawConfig?.('im-weixin-qr-login-connected');
+        await this.syncOpenClawConfig?.('im-weixin-qr-login-connected', {
+          restartGatewayIfRunning: true,
+        });
         await this.ensureOpenClawGatewayConnected?.();
       }
       return {

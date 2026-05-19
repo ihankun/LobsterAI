@@ -1290,10 +1290,12 @@ const syncOpenClawConfig = async (
     console.log(`${D()} secretEnvVars unchanged (${Object.keys(nextSecretEnvVars).length} keys)`);
   }
 
-  // Force a hard restart when the mcp-bridge callbackUrl or tools changed,
-  // MCP server config changes are handled natively by OpenClaw (SHA1 fingerprint hot-reload).
-  // No need to force restart for MCP changes — only restart for env/bindings/explicit flag.
-  const needsHardRestart = secretEnvVarsChanged || syncResult.bindingsChanged || (syncResult.changed && options.restartGatewayIfRunning);
+  // Force a hard restart when env/bindings changed, or when the caller explicitly
+  // requires a running gateway restart. Some IM account state changes are stored
+  // outside openclaw.json, so the explicit flag must not depend on config diffing.
+  const needsHardRestart = secretEnvVarsChanged
+    || syncResult.bindingsChanged === true
+    || options.restartGatewayIfRunning === true;
 
   console.log(`${D()} needsHardRestart=${needsHardRestart} (envChanged=${secretEnvVarsChanged} bindingsChanged=${!!syncResult.bindingsChanged} configChanged=${syncResult.changed} restartFlag=${!!options.restartGatewayIfRunning})`);
 
@@ -1636,9 +1638,10 @@ const getIMGatewayManager = () => {
             throw new Error(status.message || 'AI engine is initializing. Please try again in a moment.');
           }
         },
-        syncOpenClawConfig: async (reason?: string) => {
+        syncOpenClawConfig: async (reason?: string, options?: { restartGatewayIfRunning?: boolean }) => {
           await syncOpenClawConfig({
             reason: reason || 'im-gateway-sync',
+            restartGatewayIfRunning: options?.restartGatewayIfRunning,
           });
         },
         ensureOpenClawGatewayConnected: async () => {
@@ -4211,13 +4214,23 @@ if (!gotTheLock) {
   let imConfigSyncTimer: ReturnType<typeof setTimeout> | null = null;
   let imConfigSyncRunning = false;
   let imConfigSyncPending = false;
+  let imConfigSyncRestartGatewayIfRunning = false;
   const IM_CONFIG_SYNC_DEBOUNCE_MS = 600;
+  type IMConfigSyncOptions = {
+    restartGatewayIfRunning?: boolean;
+  };
+  type IMConfigSetOptions = IMConfigSyncOptions & {
+    syncGateway?: boolean;
+  };
 
   const doImConfigSync = async () => {
     imConfigSyncRunning = true;
+    const restartGatewayIfRunning = imConfigSyncRestartGatewayIfRunning;
+    imConfigSyncRestartGatewayIfRunning = false;
     try {
       await syncOpenClawConfig({
         reason: 'im-config-change',
+        restartGatewayIfRunning,
       });
       // After config sync, ensure the runtime adapter's WebSocket client
       // is connected so channel events are received.
@@ -4233,13 +4246,19 @@ if (!gotTheLock) {
     } finally {
       imConfigSyncRunning = false;
       if (imConfigSyncPending) {
+        const restartPendingGatewayIfRunning = imConfigSyncRestartGatewayIfRunning;
         imConfigSyncPending = false;
-        scheduleImConfigSync();
+        scheduleImConfigSync({
+          restartGatewayIfRunning: restartPendingGatewayIfRunning,
+        });
       }
     }
   };
 
-  const scheduleImConfigSync = () => {
+  const scheduleImConfigSync = (options: IMConfigSyncOptions = {}) => {
+    if (options.restartGatewayIfRunning) {
+      imConfigSyncRestartGatewayIfRunning = true;
+    }
     if (imConfigSyncRunning) {
       // A sync is already in progress; mark pending so it re-runs after completion.
       imConfigSyncPending = true;
@@ -4252,9 +4271,12 @@ if (!gotTheLock) {
     }, IM_CONFIG_SYNC_DEBOUNCE_MS);
   };
 
-  ipcMain.handle('im:config:set', async (_event, config: Partial<IMGatewayConfig>, options?: { syncGateway?: boolean }) => {
+  ipcMain.handle('im:config:set', async (_event, config: Partial<IMGatewayConfig>, options?: IMConfigSetOptions) => {
     try {
-      getIMGatewayManager().setConfig(config, { syncGateway: options?.syncGateway });
+      getIMGatewayManager().setConfig(config, {
+        syncGateway: options?.syncGateway,
+        restartGatewayIfRunning: options?.restartGatewayIfRunning,
+      });
 
       // Sync OpenClaw config once for all platform changes (instead of per-platform).
       // setConfig() already persists to DB synchronously, so syncOpenClawConfig just
@@ -4264,7 +4286,9 @@ if (!gotTheLock) {
       const hasOpenClawChange = config.telegram || config.discord || config.dingtalk
         || config.feishu || config.qq || config.wecom || config.popo || config.weixin;
       if (options?.syncGateway && hasOpenClawChange && getOpenClawEngineManager().getStatus().phase === 'running') {
-        scheduleImConfigSync();
+        scheduleImConfigSync({
+          restartGatewayIfRunning: options.restartGatewayIfRunning === true,
+        });
       }
       return { success: true };
     } catch (error) {
@@ -4281,7 +4305,7 @@ if (!gotTheLock) {
   ipcMain.handle('im:config:sync', async () => {
     try {
       if (getOpenClawEngineManager().getStatus().phase === 'running') {
-        scheduleImConfigSync();
+        scheduleImConfigSync({ restartGatewayIfRunning: true });
       }
       return { success: true };
     } catch (error) {

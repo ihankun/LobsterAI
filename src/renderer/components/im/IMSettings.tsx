@@ -401,10 +401,9 @@ const IMSettings: React.FC = () => {
   const weixinAccountId = weixinOpenClawConfig.accountId || weixinRuntimeAccountId;
 
   const persistConnectedWeixinConfig = async (accountId: string) => {
-    const nextConfig = { ...weixinOpenClawConfig, enabled: true, accountId };
     dispatch(setWeixinConfig({ enabled: true, accountId }));
     dispatch(clearError());
-    await imService.updateConfig({ weixin: nextConfig });
+    await imService.loadConfig();
     await imService.loadStatus();
   };
 
@@ -501,7 +500,7 @@ const IMSettings: React.FC = () => {
 
     // For Weixin, save weixin config directly (OpenClaw mode)
     if (activePlatform === 'weixin') {
-      await imService.persistConfig({ weixin: weixinOpenClawConfig });
+      await imService.updateConfig({ weixin: weixinOpenClawConfig });
       return;
     }
 

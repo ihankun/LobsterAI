@@ -2,7 +2,6 @@ import {
   CheckIcon,
   ChevronRightIcon,
   DocumentArrowDownIcon,
-  DocumentTextIcon,
   PhotoIcon,
 } from '@heroicons/react/24/outline';
 import React, { useCallback, useEffect, useLayoutEffect, useMemo,useRef, useState } from 'react';
@@ -742,6 +741,33 @@ const isContextCompactionMessage = (message: CoworkMessage): boolean => (
   message.type === 'system' && message.metadata?.kind === 'context_compaction'
 );
 
+const ContextCompressionIcon: React.FC<React.SVGProps<SVGSVGElement>> = (props) => (
+  <svg viewBox="0 0 34 34" fill="none" aria-hidden="true" {...props}>
+    <path
+      d="M6 5V24C6 26.2091 7.79086 28 10 28H22.5M28 29V10C28 7.79086 26.2091 6 24 6H11.5"
+      stroke="currentColor"
+      strokeWidth="2.4"
+      strokeLinecap="round"
+    />
+    <path
+      d="M11.5 13.5H21"
+      stroke="currentColor"
+      strokeWidth="2.4"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+    />
+    <path
+      d="M11.5 19H17"
+      stroke="currentColor"
+      strokeWidth="2.4"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+    />
+    <circle cx="6" cy="5" r="2" fill="currentColor" />
+    <circle cx="28" cy="29" r="2" fill="currentColor" />
+  </svg>
+);
+
 const ContextCompactionDivider: React.FC<{ label: string; active?: boolean }> = ({
   label,
   active = false,
@@ -752,12 +778,14 @@ const ContextCompactionDivider: React.FC<{ label: string; active?: boolean }> = 
     aria-live={active ? 'polite' : undefined}
   >
     <div className="h-px min-w-0 flex-1 bg-border" />
-    <div className="inline-flex max-w-[min(100%,360px)] items-center gap-2 bg-background px-2 text-[15px] font-medium leading-6">
-      <DocumentTextIcon
-        className={`h-4 w-4 flex-shrink-0 stroke-[1.8] ${active ? 'animate-pulse' : ''}`}
-        aria-hidden="true"
-      />
-      <span className="truncate">{label}</span>
+    <div className="flex max-w-[min(100%,360px)] flex-col items-center gap-1.5 bg-background px-2">
+      <div className="inline-flex max-w-full items-center gap-2 text-[14px] font-normal leading-[23px] text-foreground/90">
+        <ContextCompressionIcon className={`h-3.5 w-3.5 flex-shrink-0 text-foreground/70 ${active ? 'animate-pulse' : ''}`} />
+        <span className="truncate">{label}</span>
+      </div>
+      {active && (
+        <div className="context-compaction-progress w-44 max-w-full" aria-hidden="true" />
+      )}
     </div>
     <div className="h-px min-w-0 flex-1 bg-border" />
   </div>
@@ -1745,6 +1773,8 @@ const CoworkSessionDetail: React.FC<CoworkSessionDetailProps> = ({
   const isContextMaintenance = useSelector((state: RootState) =>
     currentSession?.id ? state.cowork.contextMaintenanceSessionIds.includes(currentSession.id) : false
   );
+  const isContextBusy = isContextCompacting || isContextMaintenance;
+  const isSessionBusy = isStreaming || isContextMaintenance;
   const detailRootRef = useRef<HTMLDivElement>(null);
   const scrollContainerRef = useRef<HTMLDivElement>(null);
   const promptInputRef = useRef<CoworkPromptInputRef>(null);
@@ -1822,11 +1852,11 @@ const CoworkSessionDetail: React.FC<CoworkSessionDetailProps> = ({
       console.warn('[CoworkSessionDetail] manual context compaction was ignored because no session is selected.');
       return;
     }
-    if (isContextCompacting) {
+    if (isContextBusy) {
       console.debug('[CoworkSessionDetail] manual context compaction was ignored because compaction is already running.');
       return;
     }
-    if (isStreaming || isContextMaintenance || currentSession.status === CoworkSessionStatusValue.Running) {
+    if (isSessionBusy || currentSession.status === CoworkSessionStatusValue.Running) {
       console.debug('[CoworkSessionDetail] manual context compaction was ignored because the session is still running.');
       window.dispatchEvent(new CustomEvent('app:showToast', {
         detail: i18nService.t('coworkContextCompactBlockedRunning'),
@@ -1835,7 +1865,7 @@ const CoworkSessionDetail: React.FC<CoworkSessionDetailProps> = ({
     }
     console.debug('[CoworkSessionDetail] manual context compaction confirmation toggled.');
     setShowCompactConfirm(prev => !prev);
-  }, [currentSession?.id, currentSession?.status, isContextCompacting, isContextMaintenance, isStreaming]);
+  }, [currentSession?.id, currentSession?.status, isContextBusy, isSessionBusy]);
 
   const handleCancelCompactContext = useCallback(() => {
     console.debug('[CoworkSessionDetail] manual context compaction was canceled by the user.');
@@ -3211,7 +3241,7 @@ const CoworkSessionDetail: React.FC<CoworkSessionDetailProps> = ({
       </div>
 
       {/* Streaming Activity Bar */}
-      {isStreaming && <StreamingActivityBar messages={currentSession.messages} isContextMaintenance={isContextMaintenance} />}
+      {isSessionBusy && <StreamingActivityBar messages={currentSession.messages} isContextMaintenance={isContextMaintenance} />}
 
       {/* Input Area */}
       <div className={`pt-0 pb-4 shrink-0 ${COWORK_DETAIL_GUTTER_CLASS}`}>
@@ -3220,7 +3250,7 @@ const CoworkSessionDetail: React.FC<CoworkSessionDetailProps> = ({
             ref={promptInputRef}
             onSubmit={onContinue}
             onStop={onStop}
-            isStreaming={isStreaming}
+            isStreaming={isSessionBusy}
             placeholder={i18nService.t(remoteManaged ? 'coworkRemoteManagedPlaceholder' : 'coworkContinuePlaceholder')}
             disabled={remoteManaged}
             size="large"
@@ -3236,7 +3266,7 @@ const CoworkSessionDetail: React.FC<CoworkSessionDetailProps> = ({
               <div ref={compactConfirmRef} className="relative inline-flex flex-shrink-0">
                 <ContextUsageIndicator
                   usage={contextUsage}
-                  compacting={isContextCompacting}
+                  compacting={isContextBusy}
                   disabled={remoteManaged || !currentSession?.id}
                   onCompact={handleCompactContext}
                   showTooltip={!showCompactConfirm}

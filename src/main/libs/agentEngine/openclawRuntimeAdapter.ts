@@ -163,6 +163,11 @@ const GatewayStopReason = {
   ToolUseSnake: 'tool_use',
 } as const;
 
+const OpenClawHistoryRole = {
+  Tool: 'tool',
+  ToolResult: 'toolResult',
+} as const;
+
 type ActiveTurn = {
   sessionId: string;
   sessionKey: string;
@@ -209,6 +214,14 @@ type ActiveTurn = {
   hasContextMaintenanceTool?: boolean;
   /** True while OpenClaw has reported an active context compaction stream. */
   hasContextCompactionEvent?: boolean;
+  /** True while a final may still be followed by OpenClaw compaction/retry work. */
+  pendingRecoverableFollowup?: boolean;
+  /** True while a short visible final is being held open for a possible retry continuation. */
+  pendingVisibleFinalContinuation?: boolean;
+  /** True after a recoverable wait has accepted visible continuation text. */
+  hasRecoverableContinuationText?: boolean;
+  /** True when a delayed empty-output fallback should be shown if no follow-up arrives. */
+  pendingThinkingOnlyHint?: boolean;
   /**
    * Delayed completion after chat.final. OpenClaw can emit chat.final before
    * an overflow auto-compaction/retry path continues the same run.
@@ -981,6 +994,9 @@ export class OpenClawRuntimeAdapter extends EventEmitter implements CoworkRuntim
   private static readonly CHAT_FINAL_COMPLETION_GRACE_MS = 800;
   private static readonly TOOL_USE_FINAL_LIFECYCLE_END_GRACE_MS = 45_000;
   private static readonly SILENT_MAINTENANCE_FOLLOWUP_GRACE_MS = 60_000;
+  private static readonly VISIBLE_FINAL_CONTINUATION_GRACE_MS = 120_000;
+  private static readonly VISIBLE_FINAL_TOOL_RESULT_CHAR_THRESHOLD = 20_000;
+  private static readonly VISIBLE_FINAL_SHORT_TEXT_CHAR_THRESHOLD = 600;
 
   private gatewayClient: GatewayClientLike | null = null;
   private gatewayClientVersion: string | null = null;
@@ -1063,6 +1079,70 @@ export class OpenClawRuntimeAdapter extends EventEmitter implements CoworkRuntim
   private emitContextMaintenance(sessionId: string, active: boolean): void {
     console.log(`[OpenClawRuntime] context maintenance ${active ? 'started' : 'ended'} for session ${sessionId}.`);
     this.emit('contextMaintenance', sessionId, active);
+  }
+
+  private isWaitingForRecoverableFollowup(turn: ActiveTurn): boolean {
+    return Boolean(
+      turn.hasContextMaintenanceTool
+      || turn.hasContextCompactionEvent
+      || turn.pendingRecoverableFollowup
+      || turn.pendingVisibleFinalContinuation
+      || turn.finalCompletionFlushOnLifecycleEnd === false
+    );
+  }
+
+  private clearContextMaintenanceState(sessionId: string, turn: ActiveTurn, reason: string): void {
+    const wasActive = this.isWaitingForRecoverableFollowup(turn);
+    turn.hasContextMaintenanceTool = false;
+    turn.hasContextCompactionEvent = false;
+    turn.pendingRecoverableFollowup = false;
+    turn.pendingVisibleFinalContinuation = false;
+    turn.pendingThinkingOnlyHint = false;
+    if (wasActive) {
+      this.emitContextMaintenance(sessionId, false);
+      console.debug(`[OpenClawRuntime] context maintenance ended because ${reason}.`);
+    }
+  }
+
+  private getTurnToolResultCharCount(turn: ActiveTurn): number {
+    let total = 0;
+    for (const text of turn.toolResultTextByToolCallId.values()) {
+      total += text.length;
+    }
+    return total;
+  }
+
+  private shouldWaitForVisibleFinalContinuation(
+    turn: ActiveTurn,
+    finalText: string,
+  ): { wait: boolean; reason: string; toolResultChars: number } {
+    const visibleText = finalText.trim();
+    const toolResultChars = this.getTurnToolResultCharCount(turn);
+    const hasToolWork = turn.toolUseMessageIdByToolCallId.size > 0
+      || turn.toolResultMessageIdByToolCallId.size > 0
+      || turn.toolResultTextByToolCallId.size > 0;
+
+    if (!visibleText || !hasToolWork || turn.hasRecoverableContinuationText) {
+      return { wait: false, reason: 'not a visible tool final risk', toolResultChars };
+    }
+
+    const hasMaintenanceSignal = Boolean(
+      turn.hasContextCompactionEvent
+      || turn.hasContextMaintenanceTool
+      || turn.pendingRecoverableFollowup
+      || turn.pendingVisibleFinalContinuation
+    );
+    if (hasMaintenanceSignal) {
+      return { wait: true, reason: 'context maintenance signal is active', toolResultChars };
+    }
+
+    const isShortVisibleFinal = visibleText.length <= OpenClawRuntimeAdapter.VISIBLE_FINAL_SHORT_TEXT_CHAR_THRESHOLD;
+    const hasLargeToolResults = toolResultChars >= OpenClawRuntimeAdapter.VISIBLE_FINAL_TOOL_RESULT_CHAR_THRESHOLD;
+    if (isShortVisibleFinal && hasLargeToolResults) {
+      return { wait: true, reason: 'short visible final followed large tool results', toolResultChars };
+    }
+
+    return { wait: false, reason: 'visible final does not look recoverable', toolResultChars };
   }
 
   private readNumber(record: Record<string, unknown>, keys: string[]): number | undefined {
@@ -2537,6 +2617,78 @@ export class OpenClawRuntimeAdapter extends EventEmitter implements CoworkRuntim
     }
   }
 
+  private syncToolResultsFromHistory(
+    sessionId: string,
+    turn: ActiveTurn,
+    historyMessages: unknown[],
+  ): void {
+    for (const msg of historyMessages) {
+      if (!isRecord(msg)) continue;
+
+      const msgRole = typeof msg.role === 'string' ? msg.role.trim() : '';
+      if (msgRole !== OpenClawHistoryRole.ToolResult && msgRole !== OpenClawHistoryRole.Tool) {
+        continue;
+      }
+
+      const msgToolCallId = typeof msg.toolCallId === 'string' ? msg.toolCallId.trim()
+        : typeof msg.tool_call_id === 'string' ? (msg.tool_call_id as string).trim()
+          : '';
+      if (!msgToolCallId) continue;
+
+      const text = extractMessageText(msg);
+      if (!text.trim()) continue;
+
+      const existingResultMsgId = turn.toolResultMessageIdByToolCallId.get(msgToolCallId);
+      const hasKnownToolUse = turn.toolUseMessageIdByToolCallId.has(msgToolCallId);
+      if (!hasKnownToolUse && !existingResultMsgId) {
+        console.debug(
+          '[OpenClawRuntime] skipped a tool result from chat history because it is not part of the current turn.',
+          `sessionId=${sessionId}`,
+          `toolCallId=${msgToolCallId}`,
+        );
+        continue;
+      }
+
+      const existingText = turn.toolResultTextByToolCallId.get(msgToolCallId) ?? '';
+      if (text.length <= existingText.length) continue;
+
+      const isError = Boolean(msg.isError);
+      const metadata = {
+        toolResult: text,
+        toolUseId: msgToolCallId,
+        isError,
+        isStreaming: false,
+        isFinal: true,
+      };
+
+      if (existingResultMsgId) {
+        this.store.updateMessage(sessionId, existingResultMsgId, {
+          content: text,
+          metadata,
+        });
+        turn.toolResultTextByToolCallId.set(msgToolCallId, text);
+        this.emit('messageUpdate', sessionId, existingResultMsgId, text);
+      } else {
+        const resultMessage = this.store.addMessage(sessionId, {
+          type: 'tool_result',
+          content: text,
+          metadata,
+        });
+        turn.toolResultMessageIdByToolCallId.set(msgToolCallId, resultMessage.id);
+        turn.toolResultTextByToolCallId.set(msgToolCallId, text);
+        this.emit('message', sessionId, resultMessage);
+      }
+
+      console.debug(
+        '[OpenClawRuntime] backfilled a tool result from chat history.',
+        `sessionId=${sessionId}`,
+        `toolCallId=${msgToolCallId}`,
+        `len=${text.length}`,
+        `prevLen=${existingText.length}`,
+      );
+    }
+  }
+
   /** Flush any pending throttled store write immediately (e.g. before segment split or final sync). */
   private flushPendingStoreUpdate(sessionId: string, messageId: string): void {
     const timer = this.pendingStoreUpdateTimer.get(messageId);
@@ -3263,7 +3415,7 @@ export class OpenClawRuntimeAdapter extends EventEmitter implements CoworkRuntim
         endingTurn.finalCompletionFlushOnLifecycleEnd !== false &&
         (!endingRunId || endingTurn.knownRunIds.has(endingRunId))
       ) {
-        this.completeDeferredChatFinalNow(
+        void this.completeDeferredChatFinalNow(
           sessionId,
           endingTurn,
           endingRunId ?? endingTurn.finalCompletionRunId ?? endingTurn.runId,
@@ -3359,9 +3511,14 @@ export class OpenClawRuntimeAdapter extends EventEmitter implements CoworkRuntim
     }
     this.store.updateSession(sessionId, { status: 'running' });
     this.emitSessionStatus(sessionId, 'running');
-    this.emitContextMaintenance(sessionId, false);
     const completed = data.completed === true;
     const willRetry = data.willRetry === true;
+    if (turn && willRetry) {
+      turn.pendingRecoverableFollowup = true;
+      this.emitContextMaintenance(sessionId, true);
+    } else {
+      this.emitContextMaintenance(sessionId, false);
+    }
     console.log(`[OpenClawRuntime] context compaction ended for session ${sessionId}, completed=${completed}, willRetry=${willRetry}.`);
     if (completed) {
       this.refreshAndEmitContextUsage(sessionId);
@@ -3883,7 +4040,11 @@ export class OpenClawRuntimeAdapter extends EventEmitter implements CoworkRuntim
       }
       return;
     }
+    if (this.isWaitingForRecoverableFollowup(turn)) {
+      turn.hasRecoverableContinuationText = true;
+    }
     this.postponeChatFinalCompletion(sessionId, turn, 'assistant text continued');
+    this.clearContextMaintenanceState(sessionId, turn, 'assistant text continued');
 
     // Detect text reset: new model call starts → text length drops significantly.
     // Only trigger when hwm is meaningful (> 5 chars) to avoid false positives
@@ -4009,6 +4170,10 @@ export class OpenClawRuntimeAdapter extends EventEmitter implements CoworkRuntim
       }
       return;
     }
+    if (this.isWaitingForRecoverableFollowup(turn)) {
+      turn.hasRecoverableContinuationText = true;
+    }
+    this.clearContextMaintenanceState(sessionId, turn, 'chat delta continued');
     const displayStreamedText = stripTrailingSilentReplyTail(streamedText);
     const segmentText = this.resolveAssistantSegmentText(turn, displayStreamedText);
     if (!segmentText) return;
@@ -4049,6 +4214,7 @@ export class OpenClawRuntimeAdapter extends EventEmitter implements CoworkRuntim
   private async handleChatFinal(sessionId: string, turn: ActiveTurn, payload: ChatEventPayload): Promise<void> {
     const previousText = turn.currentText;
     const previousSegmentText = turn.currentAssistantSegmentText;
+    const wasWaitingForRecoverableFinal = this.isWaitingForRecoverableFollowup(turn);
     const rawFinalText = this.resolveFinalTurnText(turn, payload.message);
     const finalText = stripTrailingSilentReplyToken(rawFinalText);
     console.debug(
@@ -4103,6 +4269,9 @@ export class OpenClawRuntimeAdapter extends EventEmitter implements CoworkRuntim
       return;
     }
     turn.currentText = finalText;
+    if (wasWaitingForRecoverableFinal && finalText.trim()) {
+      turn.hasRecoverableContinuationText = true;
+    }
     if (finalText && turn.currentContentBlocks.length === 0) {
       turn.currentContentText = finalText;
       turn.currentContentBlocks = [finalText];
@@ -4122,57 +4291,10 @@ export class OpenClawRuntimeAdapter extends EventEmitter implements CoworkRuntim
           limit: 20,
         }, { timeoutMs: 5_000 });
         if (Array.isArray(history?.messages)) {
-          for (const msg of history.messages) {
-            if (!isRecord(msg)) continue;
-            const text = extractMessageText(msg);
-
-            // Backfill tool result text: chat.history includes toolResult messages
-            // with {role: "toolResult", toolCallId: "...", content: [...]}
-            const msgRole = typeof msg.role === 'string' ? msg.role : '';
-            const msgToolCallId = typeof msg.toolCallId === 'string' ? msg.toolCallId.trim()
-              : typeof msg.tool_call_id === 'string' ? (msg.tool_call_id as string).trim()
-                : '';
-            if (msgToolCallId && (msgRole === 'toolResult' || msgRole === 'tool') && text.trim()) {
-              const existingResultMsgId = turn.toolResultMessageIdByToolCallId.get(msgToolCallId);
-              const existingText = turn.toolResultTextByToolCallId.get(msgToolCallId) ?? '';
-              if (text.length > existingText.length) {
-                const isError = Boolean(msg.isError);
-                if (existingResultMsgId) {
-                  this.store.updateMessage(sessionId, existingResultMsgId, {
-                    content: text,
-                    metadata: {
-                      toolResult: text,
-                      toolUseId: msgToolCallId,
-                      isError,
-                      isStreaming: false,
-                      isFinal: true,
-                    },
-                  });
-                  turn.toolResultTextByToolCallId.set(msgToolCallId, text);
-                  this.emit('messageUpdate', sessionId, existingResultMsgId, text);
-                } else {
-                  const resultMessage = this.store.addMessage(sessionId, {
-                    type: 'tool_result',
-                    content: text,
-                    metadata: {
-                      toolResult: text,
-                      toolUseId: msgToolCallId,
-                      isError,
-                      isStreaming: false,
-                      isFinal: true,
-                    },
-                  });
-                  turn.toolResultMessageIdByToolCallId.set(msgToolCallId, resultMessage.id);
-                  turn.toolResultTextByToolCallId.set(msgToolCallId, text);
-                  this.emit('message', sessionId, resultMessage);
-                }
-                console.log('[OpenClawRuntime] backfilled tool result from chat.history', `toolCallId=${msgToolCallId}`, `len=${text.length}`, `prevLen=${existingText.length}`);
-              }
-            }
-          }
+          this.syncToolResultsFromHistory(sessionId, turn, history.messages);
         }
       } catch (err) {
-        console.warn('[OpenClawRuntime] chat.history fetch failed:', err);
+        console.warn('[OpenClawRuntime] chat history tool result backfill failed:', err);
       }
     }
 
@@ -4308,12 +4430,18 @@ export class OpenClawRuntimeAdapter extends EventEmitter implements CoworkRuntim
         'hadToolCall:', hadToolCall,
         'lastApiResponseHadNoText:', lastApiResponseHadNoText);
       if (hadToolCall && lastApiResponseHadNoText) {
-        const hintMessage = this.store.addMessage(sessionId, {
-          type: 'system',
-          content: t('taskThinkingOnly'),
+        turn.pendingRecoverableFollowup = true;
+        turn.pendingThinkingOnlyHint = true;
+        this.store.updateSession(sessionId, { status: 'running' });
+        this.emitSessionStatus(sessionId, 'running');
+        this.emitContextMaintenance(sessionId, true);
+        this.deferChatFinalCompletion(sessionId, turn, payload.runId ?? turn.runId, {
+          graceMs: OpenClawRuntimeAdapter.SILENT_MAINTENANCE_FOLLOWUP_GRACE_MS,
+          flushOnLifecycleEnd: false,
+          allowLateContinuation: true,
         });
-        this.emit('message', sessionId, hintMessage);
-        console.warn('[OpenClawRuntime] thinking-only response detected, sessionId:', sessionId);
+        console.debug(`[OpenClawRuntime] delayed empty tool final while waiting for a recoverable follow-up in session ${sessionId}.`);
+        return;
       }
     }
 
@@ -4364,6 +4492,30 @@ export class OpenClawRuntimeAdapter extends EventEmitter implements CoworkRuntim
       }
     }
 
+    const visibleFinalTextForDecision = turn.currentText.trim() ? turn.currentText : finalText;
+    const visibleFinalContinuation = this.shouldWaitForVisibleFinalContinuation(turn, visibleFinalTextForDecision);
+    if (visibleFinalContinuation.wait) {
+      turn.pendingRecoverableFollowup = true;
+      turn.pendingVisibleFinalContinuation = true;
+      this.store.updateSession(sessionId, { status: 'running' });
+      this.emitSessionStatus(sessionId, 'running');
+      this.emitContextMaintenance(sessionId, true);
+      this.deferChatFinalCompletion(sessionId, turn, payload.runId ?? turn.runId, {
+        graceMs: OpenClawRuntimeAdapter.VISIBLE_FINAL_CONTINUATION_GRACE_MS,
+        flushOnLifecycleEnd: false,
+        allowLateContinuation: false,
+      });
+      console.debug(
+        '[OpenClawRuntime] delayed visible tool final while waiting for a recoverable continuation.',
+        `sessionId=${sessionId}`,
+        `runId=${payload.runId ?? turn.runId}`,
+        `reason=${visibleFinalContinuation.reason}`,
+        `toolResultChars=${visibleFinalContinuation.toolResultChars}`,
+        `visibleTextLen=${visibleFinalTextForDecision.trim().length}`,
+      );
+      return;
+    }
+
     this.deferChatFinalCompletion(sessionId, turn, payload.runId ?? turn.runId);
   }
 
@@ -4379,17 +4531,17 @@ export class OpenClawRuntimeAdapter extends EventEmitter implements CoworkRuntim
     this.store.updateSession(sessionId, { status: 'running' });
     this.emitSessionStatus(sessionId, 'running');
     if (isSilentMaintenanceWait) {
-      this.emitContextMaintenance(sessionId, false);
+      this.clearContextMaintenanceState(sessionId, turn, reason);
       console.debug(`[OpenClawRuntime] canceled silent maintenance completion because ${reason}.`);
       return;
     }
+    this.clearContextMaintenanceState(sessionId, turn, reason);
     this.deferChatFinalCompletion(sessionId, turn, runId);
     console.debug(`[OpenClawRuntime] postponed deferred chat.final completion because ${reason}.`);
   }
 
   private cancelChatFinalCompletion(sessionId: string, turn: ActiveTurn, reason: string): void {
     if (!turn.finalCompletionTimer) return;
-    const isSilentMaintenanceWait = turn.finalCompletionFlushOnLifecycleEnd === false;
     clearTimeout(turn.finalCompletionTimer);
     turn.finalCompletionTimer = undefined;
     turn.finalCompletionRunId = undefined;
@@ -4397,9 +4549,7 @@ export class OpenClawRuntimeAdapter extends EventEmitter implements CoworkRuntim
     turn.finalCompletionAllowLateContinuation = undefined;
     this.store.updateSession(sessionId, { status: 'running' });
     this.emitSessionStatus(sessionId, 'running');
-    if (isSilentMaintenanceWait) {
-      this.emitContextMaintenance(sessionId, false);
-    }
+    this.clearContextMaintenanceState(sessionId, turn, reason);
     console.debug(`[OpenClawRuntime] canceled deferred chat.final completion because ${reason}.`);
   }
 
@@ -4420,15 +4570,29 @@ export class OpenClawRuntimeAdapter extends EventEmitter implements CoworkRuntim
     turn.finalCompletionTimer = setTimeout(() => {
       const currentTurn = this.activeTurns.get(sessionId);
       if (!currentTurn || currentTurn.turnToken !== turnToken) return;
-      this.completeDeferredChatFinalNow(sessionId, currentTurn, runId);
+      void this.completeDeferredChatFinalNow(sessionId, currentTurn, runId);
     }, graceMs);
     console.debug('[OpenClawRuntime] deferred chat.final completion to allow retry or compaction follow-up.');
   }
 
-  private completeDeferredChatFinalNow(sessionId: string, turn: ActiveTurn, runId: string): void {
+  private async completeDeferredChatFinalNow(sessionId: string, turn: ActiveTurn, runId: string): Promise<void> {
     if (turn.finalCompletionTimer) {
       clearTimeout(turn.finalCompletionTimer);
       turn.finalCompletionTimer = undefined;
+    }
+    if (turn.pendingThinkingOnlyHint && !turn.currentText.trim()) {
+      await this.syncFinalAssistantWithHistory(sessionId, turn);
+      if (this.activeTurns.get(sessionId) !== turn) {
+        return;
+      }
+      if (!turn.currentText.trim()) {
+        const hintMessage = this.store.addMessage(sessionId, {
+          type: 'system',
+          content: t('taskThinkingOnly'),
+        });
+        this.emit('message', sessionId, hintMessage);
+        console.warn(`[OpenClawRuntime] thinking-only response detected after waiting for follow-up in session ${sessionId}.`);
+      }
     }
     if (turn.finalCompletionAllowLateContinuation) {
       turn.suppressRecentlyClosedRunIdsOnCleanup = true;
@@ -4436,6 +4600,7 @@ export class OpenClawRuntimeAdapter extends EventEmitter implements CoworkRuntim
     turn.finalCompletionRunId = undefined;
     turn.finalCompletionFlushOnLifecycleEnd = undefined;
     turn.finalCompletionAllowLateContinuation = undefined;
+    this.clearContextMaintenanceState(sessionId, turn, 'deferred completion finished');
     this.store.updateSession(sessionId, { status: 'completed' });
     this.emit('complete', sessionId, runId);
     this.cleanupSessionTurn(sessionId);
@@ -5140,6 +5305,8 @@ export class OpenClawRuntimeAdapter extends EventEmitter implements CoworkRuntim
           return;
         }
 
+        this.syncToolResultsFromHistory(sessionId, turn, history.messages);
+
         // Use turn-aware extraction for ALL session types.
         // The previous non-channel backward scan could return stale assistant text
         // from a prior turn when the gateway rejected the current run (empty final).
@@ -5611,7 +5778,7 @@ export class OpenClawRuntimeAdapter extends EventEmitter implements CoworkRuntim
         turn.finalCompletionFlushOnLifecycleEnd = undefined;
         turn.finalCompletionAllowLateContinuation = undefined;
       }
-      if (turn.hasContextMaintenanceTool || turn.hasContextCompactionEvent) {
+      if (turn.hasContextMaintenanceTool || turn.hasContextCompactionEvent || turn.pendingRecoverableFollowup) {
         this.emitContextMaintenance(sessionId, false);
       }
       // Cancel any pending throttled messageUpdate timer for this turn

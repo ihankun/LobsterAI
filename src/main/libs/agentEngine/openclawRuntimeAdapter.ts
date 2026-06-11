@@ -3100,6 +3100,11 @@ export class OpenClawRuntimeAdapter extends EventEmitter implements CoworkRuntim
           console.warn('[OpenClawRuntime] Failed to abort chat run:', error);
         });
       }
+    } else {
+      console.log(
+        '[OpenClawRuntime] received stop before a gateway run became active.',
+        `Session ${sessionId}.`,
+      );
     }
 
     // Record the stop timestamp so that late-arriving gateway events
@@ -3109,8 +3114,27 @@ export class OpenClawRuntimeAdapter extends EventEmitter implements CoworkRuntim
     this.cleanupSessionTurn(sessionId);
     this.clearPendingApprovalsBySession(sessionId);
     this.store.updateSession(sessionId, { status: 'idle' });
+    this.emitSessionStatus(sessionId, 'idle');
     this.emit('sessionStopped', sessionId);
     this.resolveTurn(sessionId);
+  }
+
+  private cancelTurnStartupIfStopped(sessionId: string, checkpoint: string): boolean {
+    if (!this.stoppedSessions.has(sessionId)) {
+      return false;
+    }
+    console.log(
+      '[OpenClawRuntime] cancelled turn startup after user stop.',
+      `Session ${sessionId}.`,
+      `Checkpoint ${checkpoint}.`,
+    );
+    this.cleanupSessionTurn(sessionId);
+    this.stoppedSessions.delete(sessionId);
+    this.manuallyStoppedSessions.delete(sessionId);
+    this.store.updateSession(sessionId, { status: 'idle' });
+    this.emitSessionStatus(sessionId, 'idle');
+    this.resolveTurn(sessionId);
+    return true;
   }
 
   stopAllSessions(): void {
@@ -3370,6 +3394,9 @@ export class OpenClawRuntimeAdapter extends EventEmitter implements CoworkRuntim
     setCoworkProxySessionId(sessionId);
     firstResponseTiming.gatewayReadyStartedAtMs = Date.now();
     await this.ensureGatewayClientReady();
+    if (this.cancelTurnStartupIfStopped(sessionId, 'gateway client became ready')) {
+      return;
+    }
     firstResponseTiming.gatewayReadyEndedAtMs = Date.now();
     console.log(
       '[OpenClawRuntimeTiming] gateway client ready.',
@@ -3402,6 +3429,9 @@ export class OpenClawRuntimeAdapter extends EventEmitter implements CoworkRuntim
           ? SessionModelPatchSource.SessionOverride
           : SessionModelPatchSource.AgentModel,
       });
+      if (this.cancelTurnStartupIfStopped(sessionId, 'session model sync finished')) {
+        return;
+      }
       firstResponseTiming.modelPatchEndedAtMs = Date.now();
       console.log(
         '[OpenClawRuntimeTiming] session model sync finished.',
@@ -3434,6 +3464,9 @@ export class OpenClawRuntimeAdapter extends EventEmitter implements CoworkRuntim
       options.selectedTextSnippets,
       firstResponseTiming,
     );
+    if (this.cancelTurnStartupIfStopped(sessionId, 'outbound prompt built')) {
+      return;
+    }
     firstResponseTiming.promptBuildEndedAtMs = Date.now();
     console.log(
       '[OpenClawRuntimeTiming] outbound prompt built.',

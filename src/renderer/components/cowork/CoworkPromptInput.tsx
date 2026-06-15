@@ -518,6 +518,10 @@ const CoworkPromptInput = React.forwardRef<CoworkPromptInputRef, CoworkPromptInp
   }, [dispatch, ensureFreshAsrQuota, isLoggedIn]);
 
   const handleVoiceInputClick = useCallback(() => {
+    if (isVoiceRecording) {
+      void handleVoiceInput();
+      return;
+    }
     if (disabled) return;
     if (!isLoggedIn) {
       setShowVoiceLoginPrompt(true);
@@ -531,7 +535,7 @@ const CoworkPromptInput = React.forwardRef<CoworkPromptInputRef, CoworkPromptInp
       return;
     }
     void handleVoiceInput();
-  }, [asrQuota.dayKey, asrQuota.status, disabled, dispatch, handleVoiceInput, isLoggedIn]);
+  }, [asrQuota.dayKey, asrQuota.status, disabled, dispatch, handleVoiceInput, isLoggedIn, isVoiceRecording]);
 
   // Load skills on mount
   useEffect(() => {
